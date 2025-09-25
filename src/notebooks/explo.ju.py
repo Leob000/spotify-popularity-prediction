@@ -1,10 +1,10 @@
 # %%
 # ruff: noqa: E402
-import pandas as pd
-import matplotlib.pyplot as plt
-
 import sys
 from pathlib import Path
+
+import matplotlib.pyplot as plt
+import pandas as pd
 
 # Util to import functions from project root
 p = Path.cwd()
@@ -19,6 +19,8 @@ root = next(
 if root is None:
     root = Path.cwd()
 sys.path.insert(0, str(root))
+
+from src.modelling.data_processing import DataFrameTransformer
 
 # %%
 df = pd.read_csv("../data/train_data.csv")
@@ -102,14 +104,8 @@ for col in cols_cat:
 # time_signature: 1/2/5 seem quite similar, 4 is the most common and is different, 0 is rare and different.
 # -> We could group the signatures by 3 categorical variable: is4, is0, is1-3-5
 
-from src.modelling.data_processing import make_time_signature_cats
-
-df = make_time_signature_cats(df)
-
-cols_cat.remove("time_signature")
-cols_cat.extend(
-    ["is_time_signature_4", "is_time_signature_0", "is_time_signature_1_3_5"]
-)
+df_transformer = DataFrameTransformer(drop_cols=True, make_plots=True)
+df = df_transformer.make_time_signature_cats(df)
 
 # %%
 # The key and the mode doesn't seem to capture a lot of popularity information.
@@ -117,9 +113,7 @@ cols_cat.extend(
 # See: https://en.wikipedia.org/wiki/Circle_of_fifths#/media/File:Circle_of_fifths_deluxe_4.svg
 # We get 12 categorical variables, we can either keep them as this or represent them with sin/cos.
 
-from src.modelling.data_processing import make_circle_of_fifths
-
-df = make_circle_of_fifths(df, make_plots=True)
+df = df_transformer.make_circle_of_fifths(df)
 
 # %%
 for col in cols_num:
@@ -131,3 +125,18 @@ for col in cols_num:
         plt.show()
 
 # Identification of some outliers and clusters, we could study further to see if they correspond to specific genres.
+
+# %%
+# Test the pipeline
+from src.modelling.data_processing import CustomColumnScaler
+
+df_transformer = DataFrameTransformer()
+scaler = CustomColumnScaler()
+
+
+X_train = pd.read_csv("../data/train_data.csv")
+X_train = df_transformer.fit_transform(X_train)
+X_train = scaler.fit_transform(X_train)
+X_train.describe()
+
+# %%
