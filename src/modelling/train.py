@@ -99,7 +99,8 @@ def oof_model_preds_with_folds(
     idx = y.index
     oof = pd.Series(np.nan, index=idx, dtype=float)
 
-    for tr_idx, va_idx in folds:
+    n_folds = len(folds)
+    for fold_idx, (tr_idx, va_idx) in enumerate(folds, start=1):
         tr_ids = idx.take(tr_idx)
         va_ids = idx.take(va_idx)
 
@@ -111,14 +112,22 @@ def oof_model_preds_with_folds(
         X_va_s = scaler.transform(X_va)
 
         model = model_ctor(seed)
+        print(f"Starting training fold {fold_idx}/{n_folds} (seed={seed})...")
+        t0 = time.time()
         model.fit(X_tr_s, y_tr.to_numpy())
+        elapsed = time.time() - t0
+        print(f"Finished training fold {fold_idx}/{n_folds} in {elapsed:.2f} sec.")
         oof.loc[va_ids] = model.predict(X_va_s)
 
     # full-data fit
     full_scaler = CustomColumnScaler()
     X_s = full_scaler.fit_transform(X)
     full_model = model_ctor(seed)
+    print("Starting full-data model training...")
+    t0 = time.time()
     full_model.fit(X_s, y.to_numpy())
+    elapsed = time.time() - t0
+    print(f"Finished full-data model training in {elapsed:.2f} sec.")
 
     return oof.to_numpy(), full_model, full_scaler
 
@@ -143,7 +152,8 @@ def oof_residual_model_preds_with_folds(
     residual = y.to_numpy() - mu_oof
     oof_final = pd.Series(np.nan, index=idx, dtype=float)
 
-    for tr_idx, va_idx in folds:
+    n_folds = len(folds)
+    for fold_idx, (tr_idx, va_idx) in enumerate(folds, start=1):
         tr_ids = idx.take(tr_idx)
         va_ids = idx.take(va_idx)
 
@@ -155,7 +165,11 @@ def oof_residual_model_preds_with_folds(
         X_va_s = scaler.transform(X_va)
 
         model = model_ctor(seed)
+        print(f"Starting residual training fold {fold_idx}/{n_folds} (seed={seed})...")
+        t0 = time.time()
         model.fit(X_tr_s, res_tr)
+        elapsed = time.time() - t0
+        print(f"Finished residual training fold {fold_idx}/{n_folds} in {elapsed:.2f} sec.")
         res_pred_va = model.predict(X_va_s)
         oof_final.loc[va_ids] = mu_oof[va_idx] + res_pred_va
 
@@ -163,7 +177,11 @@ def oof_residual_model_preds_with_folds(
     full_scaler = CustomColumnScaler()
     X_s = full_scaler.fit_transform(X)
     full_model = model_ctor(seed)
+    print("Starting full-data residual model training...")
+    t0 = time.time()
     full_model.fit(X_s, residual)
+    elapsed = time.time() - t0
+    print(f"Finished full-data residual model training in {elapsed:.2f} sec.")
 
     return oof_final.to_numpy(), full_model, full_scaler
 
