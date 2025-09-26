@@ -1,4 +1,5 @@
 import argparse
+import time
 
 import numpy as np
 import pandas as pd
@@ -294,4 +295,6 @@ if __name__ == "__main__":
         help="Print top-20 feature importances from full-data models",
     )
     args = parser.parse_args()
+    start_time = time.time()
     main(args)
+    print(f"Done in {(time.time() - start_time) / 60.0:.2f} minutes.")
