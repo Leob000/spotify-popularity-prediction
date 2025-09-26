@@ -4,7 +4,7 @@ DATA_DIR=src/data/
 SUBMIT_FILE?=submission.csv
 SUBMIT_MSG?="Submission"
 
-MODE?=m2 # [ensemble, m1, m2]
+MODE?=ensemble # [ensemble, m1, m2]
 SEED?=42
 
 M2_M?=150.0

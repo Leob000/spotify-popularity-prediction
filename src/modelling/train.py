@@ -271,6 +271,40 @@ def main(args):
                 m2_full, X.columns, model_name="M2 residual (full-data)"
             )
 
+    # Inference on test set and save submission CSV
+    # Load and transform test set using the same transformer pipeline as training.
+    test_df = df_transformer.transform(pd.read_csv(f"{DATA_DIR}/test_data.csv"))
+    # Preserve row ids for the submission
+    row_ids = test_df.index.to_numpy()
+
+    # Prepare feature matrix for models: drop target (if present) and genre column
+    X_test = test_df.drop(columns=[TARGET, GENRE], errors="ignore")
+
+    if args.mode == "m1":
+        X_test_s = m1_scaler.transform(X_test)
+        pred_norm = m1_full.predict(X_test_s)
+    elif args.mode == "m2":
+        # genre map learned on full training data
+        mu_test = test_df[GENRE].map(genre_map_full).fillna(gmean).to_numpy()
+        X_test_s = m2_scaler.transform(X_test)
+        res_pred = m2_full.predict(X_test_s)
+        pred_norm = mu_test + res_pred
+    else:
+        # ensemble: blend full-data predictions
+        X_test_s_m1 = m1_scaler.transform(X_test)
+        p1 = m1_full.predict(X_test_s_m1)
+        mu_test = test_df[GENRE].map(genre_map_full).fillna(gmean).to_numpy()
+        X_test_s_m2 = m2_scaler.transform(X_test)
+        p2 = mu_test + m2_full.predict(X_test_s_m2)
+        pred_norm = np.clip(w_best * p2 + (1 - w_best) * p1, 0.0, 1.0)
+
+    # DataFrameTransformer scaled target by 100 during training, so we undo that
+    pred_clipped = np.clip(pred_norm, 0.0, 1.0) * 100.0
+
+    submission = pd.DataFrame({"row_id": row_ids, "popularity": pred_clipped})
+    submission.to_csv(f"{DATA_DIR}/submission.csv", index=False)
+    print(f"Saved submission to {DATA_DIR}/submission.csv")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
