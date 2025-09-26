@@ -23,7 +23,7 @@ sys.path.insert(0, str(root))
 from src.modelling.data_processing import DataFrameTransformer
 
 # %%
-df = pd.read_csv("../data/train_data.csv")
+df = pd.read_csv("../src/data/train_data.csv")
 cols = df.columns.tolist()
 df.head()
 # %%
@@ -134,7 +134,7 @@ df_transformer = DataFrameTransformer()
 scaler = CustomColumnScaler()
 
 
-X_train = pd.read_csv("../data/train_data.csv")
+X_train = pd.read_csv("../src/data/train_data.csv")
 X_train = df_transformer.fit_transform(X_train)
 X_train = scaler.fit_transform(X_train)
 X_train.describe()
