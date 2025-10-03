@@ -81,6 +81,7 @@ def oof_genre_mean_with_folds(genre: pd.Series, y: pd.Series, folds, m: float = 
 
 
 def rf_ctor(seed):
+    """Return a configured RandomForestRegressor seeded for reproducibility."""
     return RandomForestRegressor(
         n_estimators=500, random_state=seed, n_jobs=-1, max_features="sqrt"
     )
@@ -251,6 +252,7 @@ def best_blend_weight(y_true: np.ndarray, p1: np.ndarray, p2: np.ndarray, step=0
 
 
 def per_fold_scores(y: np.ndarray, preds: np.ndarray, folds):
+    """Compute per-fold R² scores from the provided predictions."""
     scores = []
     for _, va_idx in folds:
         scores.append(r2_score(y[va_idx], preds[va_idx]))
@@ -270,6 +272,7 @@ def print_feature_importance(model, feature_names, model_name):
 
 
 def main(args):
+    """Execute the training and evaluation workflow based on parsed CLI args."""
     df_transformer = DataFrameTransformer()
     df = df_transformer.transform(pd.read_csv(f"{DATA_DIR}/train_data.csv"))
 
