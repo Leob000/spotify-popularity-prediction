@@ -1,5 +1,6 @@
 import argparse
 import time
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -72,13 +73,11 @@ def oof_genre_mean_with_folds(genre: pd.Series, y: pd.Series, folds, m: float = 
         oof.loc[va_ids] = genre.loc[va_ids].map(smooth).fillna(gmean).values
 
     # Full-data mapping (useful for inference on new data)
-    gdf_full = pd.DataFrame({GENRE: genre, TARGET: y})
-    agg_full = gdf_full.groupby(GENRE)[TARGET].agg(["mean", "size"])
-    smooth_full = (agg_full["size"] * agg_full["mean"] + m * gmean) / (
-        agg_full["size"] + m
+    smooth_full_dict, _ = compute_genre_smoothing(
+        genre=genre, y=y, m=m, global_mean=gmean
     )
 
-    return oof.to_numpy(), smooth_full.to_dict(), gmean
+    return oof.to_numpy(), smooth_full_dict, gmean
 
 
 def rf_ctor(seed):
@@ -87,8 +86,49 @@ def rf_ctor(seed):
     )
 
 
+def compute_genre_smoothing(
+    genre: pd.Series,
+    y: pd.Series,
+    m: float,
+    global_mean: Optional[float] = None,
+) -> Tuple[Dict[str, float], float]:
+    """Compute smoothed genre means on the full dataset."""
+    gmean = float(y.mean()) if global_mean is None else float(global_mean)
+    gdf_full = pd.DataFrame({GENRE: genre, TARGET: y})
+    agg_full = gdf_full.groupby(GENRE)[TARGET].agg(["mean", "size"])
+    smooth_full = (agg_full["size"] * agg_full["mean"] + m * gmean) / (
+        agg_full["size"] + m
+    )
+    return smooth_full.to_dict(), gmean
+
+
+def fit_full_model(
+    model_ctor,
+    X: pd.DataFrame,
+    target: np.ndarray,
+    seed: int,
+    start_message: str,
+    end_message_template: str,
+):
+    """Fit a model on the full dataset with leakage-free scaling."""
+    scaler = CustomColumnScaler()
+    X_scaled = scaler.fit_transform(X)
+    model = model_ctor(seed)
+    print(start_message)
+    t0 = time.time()
+    model.fit(X_scaled, target)
+    elapsed = time.time() - t0
+    print(end_message_template.format(elapsed=elapsed))
+    return model, scaler
+
+
 def oof_model_preds_with_folds(
-    model_ctor, X: pd.DataFrame, y: pd.Series, folds, seed: int
+    model_ctor,
+    X: pd.DataFrame,
+    y: pd.Series,
+    folds,
+    seed: int,
+    fit_full: bool = True,
 ):
     """
     Generic OOF predictions for a direct y->model (no residualization) on the
@@ -119,21 +159,29 @@ def oof_model_preds_with_folds(
         print(f"Finished training fold {fold_idx}/{n_folds} in {elapsed:.2f} sec.")
         oof.loc[va_ids] = model.predict(X_va_s)
 
-    # full-data fit
-    full_scaler = CustomColumnScaler()
-    X_s = full_scaler.fit_transform(X)
-    full_model = model_ctor(seed)
-    print("Starting full-data model training...")
-    t0 = time.time()
-    full_model.fit(X_s, y.to_numpy())
-    elapsed = time.time() - t0
-    print(f"Finished full-data model training in {elapsed:.2f} sec.")
+    full_model = None
+    full_scaler = None
+    if fit_full:
+        full_model, full_scaler = fit_full_model(
+            model_ctor=model_ctor,
+            X=X,
+            target=y.to_numpy(),
+            seed=seed,
+            start_message="Starting full-data model training...",
+            end_message_template="Finished full-data model training in {elapsed:.2f} sec.",
+        )
 
     return oof.to_numpy(), full_model, full_scaler
 
 
 def oof_residual_model_preds_with_folds(
-    model_ctor, X: pd.DataFrame, y: pd.Series, mu_oof: np.ndarray, folds, seed: int
+    model_ctor,
+    X: pd.DataFrame,
+    y: pd.Series,
+    mu_oof: np.ndarray,
+    folds,
+    seed: int,
+    fit_full: bool = True,
 ):
     """
     Out-of-fold (OOF) residual modelling with leakage-free scaling.
@@ -169,19 +217,23 @@ def oof_residual_model_preds_with_folds(
         t0 = time.time()
         model.fit(X_tr_s, res_tr)
         elapsed = time.time() - t0
-        print(f"Finished residual training fold {fold_idx}/{n_folds} in {elapsed:.2f} sec.")
+        print(
+            f"Finished residual training fold {fold_idx}/{n_folds} in {elapsed:.2f} sec."
+        )
         res_pred_va = model.predict(X_va_s)
         oof_final.loc[va_ids] = mu_oof[va_idx] + res_pred_va
 
-    # full-data residual fit
-    full_scaler = CustomColumnScaler()
-    X_s = full_scaler.fit_transform(X)
-    full_model = model_ctor(seed)
-    print("Starting full-data residual model training...")
-    t0 = time.time()
-    full_model.fit(X_s, residual)
-    elapsed = time.time() - t0
-    print(f"Finished full-data residual model training in {elapsed:.2f} sec.")
+    full_model = None
+    full_scaler = None
+    if fit_full:
+        full_model, full_scaler = fit_full_model(
+            model_ctor=model_ctor,
+            X=X,
+            target=residual,
+            seed=seed,
+            start_message="Starting full-data residual model training...",
+            end_message_template="Finished full-data residual model training in {elapsed:.2f} sec.",
+        )
 
     return oof_final.to_numpy(), full_model, full_scaler
 
@@ -225,103 +277,232 @@ def main(args):
     genres = df[GENRE]
     X = df.drop(columns=[TARGET, GENRE])
 
-    folds = make_folds(y, n_splits=args.folds, seed=args.seed)
+    run_cv = args.execution in ("cv", "both")
+    run_train = args.execution in ("train", "both")
 
-    # Train
-    if args.mode in ("m2", "ensemble"):
-        mu_oof, genre_map_full, gmean = oof_genre_mean_with_folds(
-            genre=genres, y=y, folds=folds, m=args.m2_m
-        )
-        # genre-only baseline CV score
-        r2_mu_only = r2_score(y, mu_oof)
-        # residual model OOF preds
-        oof_m2, m2_full, m2_scaler = oof_residual_model_preds_with_folds(
-            rf_ctor, X, y, mu_oof=mu_oof, folds=folds, seed=args.seed
-        )
-        r2_m2 = r2_score(y, oof_m2)
-        pf_m2 = per_fold_scores(y.to_numpy(), oof_m2, folds)
+    folds = make_folds(y, n_splits=args.folds, seed=args.seed) if run_cv else None
 
-    if args.mode in ("m1", "ensemble"):
-        oof_m1, m1_full, m1_scaler = oof_model_preds_with_folds(
-            rf_ctor, X, y, folds=folds, seed=args.seed
-        )
-        r2_m1 = r2_score(y, oof_m1)
-        pf_m1 = per_fold_scores(y.to_numpy(), oof_m1, folds)
+    mu_oof = None
+    genre_map_full: Optional[Dict[str, float]] = None
+    gmean: Optional[float] = None
 
-    # Report
-    if args.mode == "m1":
-        print("Mode: M1 (no-genre) — Cross-validated (OOF) results")
-        print(
-            f"OOF R2 M1: {r2_m1:.5f}  | folds mean={pf_m1.mean():.5f} std={pf_m1.std():.5f}"
-        )
-        if args.show_importance:
-            print_feature_importance(m1_full, X.columns, model_name="M1 (full-data)")
-    elif args.mode == "m2":
-        print("Mode: M2 (genre-residual) — Cross-validated (OOF) results")
-        print(f"OOF R2 genre-only baseline (mu_genre): {r2_mu_only:.5f}")
-        print(
-            f"OOF R2 M2 (mu_genre + residual RF):   {r2_m2:.5f}  | folds mean={pf_m2.mean():.5f} std={pf_m2.std():.5f}"
-        )
-        if args.show_importance:
-            print_feature_importance(
-                m2_full, X.columns, model_name="M2 residual (full-data)"
+    oof_m1 = None
+    m1_full = None
+    m1_scaler = None
+    r2_m1 = None
+    pf_m1 = None
+
+    oof_m2 = None
+    m2_full = None
+    m2_scaler = None
+    r2_m2 = None
+    pf_m2 = None
+    r2_mu_only = None
+
+    w_best = None
+    r2_blend = None
+    pf_blend = None
+
+    if run_cv:
+        if args.mode in ("m2", "ensemble"):
+            mu_oof, genre_map_full_cv, gmean_cv = oof_genre_mean_with_folds(
+                genre=genres, y=y, folds=folds, m=args.m2_m
             )
-    else:
-        # ensemble: learn weight on OOF only, then score OOF blend
-        w_best, r2_blend_train = best_blend_weight(
-            y_true=y.to_numpy(), p1=oof_m1, p2=oof_m2, step=0.01
-        )
-        oof_blend = np.clip(w_best * oof_m2 + (1 - w_best) * oof_m1, 0.0, 1.0)
-        r2_blend = r2_score(y, oof_blend)
-        pf_blend = per_fold_scores(y.to_numpy(), oof_blend, folds)
+            genre_map_full = genre_map_full_cv
+            gmean = gmean_cv
+            r2_mu_only = r2_score(y, mu_oof)
+            oof_m2, m2_full_cv, m2_scaler_cv = oof_residual_model_preds_with_folds(
+                rf_ctor,
+                X,
+                y,
+                mu_oof=mu_oof,
+                folds=folds,
+                seed=args.seed,
+                fit_full=run_train,
+            )
+            r2_m2 = r2_score(y, oof_m2)
+            pf_m2 = per_fold_scores(y.to_numpy(), oof_m2, folds)
+            if run_train:
+                m2_full = m2_full_cv
+                m2_scaler = m2_scaler_cv
+        if args.mode in ("m1", "ensemble"):
+            oof_m1, m1_full_cv, m1_scaler_cv = oof_model_preds_with_folds(
+                rf_ctor,
+                X,
+                y,
+                folds=folds,
+                seed=args.seed,
+                fit_full=run_train,
+            )
+            r2_m1 = r2_score(y, oof_m1)
+            pf_m1 = per_fold_scores(y.to_numpy(), oof_m1, folds)
+            if run_train:
+                m1_full = m1_full_cv
+                m1_scaler = m1_scaler_cv
+        if args.mode == "ensemble":
+            if oof_m1 is None or oof_m2 is None:
+                raise ValueError("Ensemble mode requires both M1 and M2 predictions.")
+            w_best, _ = best_blend_weight(
+                y_true=y.to_numpy(), p1=oof_m1, p2=oof_m2, step=0.01
+            )
+            oof_blend = np.clip(w_best * oof_m2 + (1 - w_best) * oof_m1, 0.0, 1.0)
+            r2_blend = r2_score(y, oof_blend)
+            pf_blend = per_fold_scores(y.to_numpy(), oof_blend, folds)
 
-        print("Mode: ENSEMBLE (M1 + M2) — Cross-validated (OOF) results")
-        print(f"Learned blend weight w on OOF (p = w*M2 + (1-w)*M1): {w_best:.2f}")
-        print(f"OOF R2 M1:      {r2_m1:.5f}")
-        print(f"OOF R2 M2:      {r2_m2:.5f}")
-        print(
-            f"OOF R2 BLEND:   {r2_blend:.5f}  | folds mean={pf_blend.mean():.5f} std={pf_blend.std():.5f}"
-        )
-        print(f"(For reference) OOF R2 mu_genre baseline: {r2_score(y, mu_oof):.5f}")
-        if args.show_importance:
-            print_feature_importance(m1_full, X.columns, model_name="M1 (full-data)")
-            print_feature_importance(
-                m2_full, X.columns, model_name="M2 residual (full-data)"
+        if args.mode == "m1":
+            print("Mode: M1 (no-genre) — Cross-validated (OOF) results")
+            if r2_m1 is not None and pf_m1 is not None:
+                print(
+                    f"OOF R2 M1: {r2_m1:.5f}  | folds mean={pf_m1.mean():.5f} std={pf_m1.std():.5f}"
+                )
+            if run_train and args.show_importance and m1_full is not None:
+                print_feature_importance(
+                    m1_full, X.columns, model_name="M1 (full-data)"
+                )
+        elif args.mode == "m2":
+            print("Mode: M2 (genre-residual) — Cross-validated (OOF) results")
+            if r2_mu_only is not None:
+                print(f"OOF R2 genre-only baseline (mu_genre): {r2_mu_only:.5f}")
+            if r2_m2 is not None and pf_m2 is not None:
+                print(
+                    f"OOF R2 M2 (mu_genre + residual RF):   {r2_m2:.5f}  | folds mean={pf_m2.mean():.5f} std={pf_m2.std():.5f}"
+                )
+            if run_train and args.show_importance and m2_full is not None:
+                print_feature_importance(
+                    m2_full, X.columns, model_name="M2 residual (full-data)"
+                )
+        else:
+            print("Mode: ENSEMBLE (M1 + M2) — Cross-validated (OOF) results")
+            if w_best is not None:
+                print(
+                    f"Learned blend weight w on OOF (p = w*M2 + (1-w)*M1): {w_best:.2f}"
+                )
+            if r2_m1 is not None:
+                print(f"OOF R2 M1:      {r2_m1:.5f}")
+            if r2_m2 is not None:
+                print(f"OOF R2 M2:      {r2_m2:.5f}")
+            if r2_blend is not None and pf_blend is not None:
+                print(
+                    f"OOF R2 BLEND:   {r2_blend:.5f}  | folds mean={pf_blend.mean():.5f} std={pf_blend.std():.5f}"
+                )
+            if r2_mu_only is not None:
+                print(f"(For reference) OOF R2 mu_genre baseline: {r2_mu_only:.5f}")
+            if run_train and args.show_importance:
+                if m1_full is not None:
+                    print_feature_importance(
+                        m1_full, X.columns, model_name="M1 (full-data)"
+                    )
+                if m2_full is not None:
+                    print_feature_importance(
+                        m2_full, X.columns, model_name="M2 residual (full-data)"
+                    )
+
+    if run_train:
+        if not run_cv:
+            if args.mode in ("m2", "ensemble"):
+                genre_map_full, gmean = compute_genre_smoothing(
+                    genre=genres, y=y, m=args.m2_m
+                )
+                mu_train = genres.map(genre_map_full).fillna(gmean).to_numpy()
+                m2_full, m2_scaler = fit_full_model(
+                    model_ctor=rf_ctor,
+                    X=X,
+                    target=y.to_numpy() - mu_train,
+                    seed=args.seed,
+                    start_message="Starting full-data residual model training...",
+                    end_message_template=(
+                        "Finished full-data residual model training in {elapsed:.2f} sec."
+                    ),
+                )
+            else:
+                mu_train = None
+            if args.mode in ("m1", "ensemble"):
+                m1_full, m1_scaler = fit_full_model(
+                    model_ctor=rf_ctor,
+                    X=X,
+                    target=y.to_numpy(),
+                    seed=args.seed,
+                    start_message="Starting full-data model training...",
+                    end_message_template=(
+                        "Finished full-data model training in {elapsed:.2f} sec."
+                    ),
+                )
+            if args.mode == "ensemble" and genre_map_full is None:
+                genre_map_full, gmean = compute_genre_smoothing(
+                    genre=genres, y=y, m=args.m2_m
+                )
+        elif args.mode in ("m2", "ensemble") and genre_map_full is None:
+            genre_map_full, gmean = compute_genre_smoothing(
+                genre=genres, y=y, m=args.m2_m
             )
 
-    # Inference on test set and save submission CSV
-    # Load and transform test set using the same transformer pipeline as training.
-    test_df = df_transformer.transform(pd.read_csv(f"{DATA_DIR}/test_data.csv"))
-    # Preserve row ids for the submission
-    row_ids = test_df.index.to_numpy()
+        if args.mode == "ensemble" and w_best is None:
+            train_mu = genres.map(genre_map_full).fillna(gmean).to_numpy()
+            assert m1_full is not None and m1_scaler is not None
+            assert m2_full is not None and m2_scaler is not None
+            X_train_s_m1 = m1_scaler.transform(X)
+            p1_train = m1_full.predict(X_train_s_m1)
+            X_train_s_m2 = m2_scaler.transform(X)
+            p2_train = train_mu + m2_full.predict(X_train_s_m2)
+            w_best, _ = best_blend_weight(
+                y_true=y.to_numpy(), p1=p1_train, p2=p2_train, step=0.01
+            )
+            print(f"Computed blend weight on training data: {w_best:.2f}")
 
-    # Prepare feature matrix for models: drop target (if present) and genre column
-    X_test = test_df.drop(columns=[TARGET, GENRE], errors="ignore")
+        if args.show_importance and not run_cv:
+            if args.mode in ("m1", "ensemble") and m1_full is not None:
+                print_feature_importance(
+                    m1_full, X.columns, model_name="M1 (full-data)"
+                )
+            if args.mode in ("m2", "ensemble") and m2_full is not None:
+                print_feature_importance(
+                    m2_full, X.columns, model_name="M2 residual (full-data)"
+                )
 
-    if args.mode == "m1":
-        X_test_s = m1_scaler.transform(X_test)
-        pred_norm = m1_full.predict(X_test_s)
-    elif args.mode == "m2":
-        # genre map learned on full training data
-        mu_test = test_df[GENRE].map(genre_map_full).fillna(gmean).to_numpy()
-        X_test_s = m2_scaler.transform(X_test)
-        res_pred = m2_full.predict(X_test_s)
-        pred_norm = mu_test + res_pred
-    else:
-        # ensemble: blend full-data predictions
-        X_test_s_m1 = m1_scaler.transform(X_test)
-        p1 = m1_full.predict(X_test_s_m1)
-        mu_test = test_df[GENRE].map(genre_map_full).fillna(gmean).to_numpy()
-        X_test_s_m2 = m2_scaler.transform(X_test)
-        p2 = mu_test + m2_full.predict(X_test_s_m2)
-        pred_norm = np.clip(w_best * p2 + (1 - w_best) * p1, 0.0, 1.0)
+        test_df = df_transformer.transform(pd.read_csv(f"{DATA_DIR}/test_data.csv"))
+        row_ids = test_df.index.to_numpy()
+        X_test = test_df.drop(columns=[TARGET, GENRE], errors="ignore")
 
-    # DataFrameTransformer scaled target by 100 during training, so we undo that
-    pred_clipped = np.clip(pred_norm, 0.0, 1.0) * 100.0
+        if args.mode == "m1":
+            if m1_scaler is None or m1_full is None:
+                raise ValueError("M1 full model not available for inference.")
+            X_test_s = m1_scaler.transform(X_test)
+            pred_norm = m1_full.predict(X_test_s)
+        elif args.mode == "m2":
+            if genre_map_full is None or gmean is None:
+                genre_map_full, gmean = compute_genre_smoothing(
+                    genre=genres, y=y, m=args.m2_m
+                )
+            mu_test = test_df[GENRE].map(genre_map_full).fillna(gmean).to_numpy()
+            if m2_scaler is None or m2_full is None:
+                raise ValueError("M2 full model not available for inference.")
+            X_test_s = m2_scaler.transform(X_test)
+            res_pred = m2_full.predict(X_test_s)
+            pred_norm = mu_test + res_pred
+        else:
+            if w_best is None:
+                raise ValueError("Blend weight unavailable for ensemble inference.")
+            if (
+                m1_scaler is None
+                or m1_full is None
+                or m2_scaler is None
+                or m2_full is None
+                or genre_map_full is None
+                or gmean is None
+            ):
+                raise ValueError("Full models not available for ensemble inference.")
+            X_test_s_m1 = m1_scaler.transform(X_test)
+            p1 = m1_full.predict(X_test_s_m1)
+            mu_test = test_df[GENRE].map(genre_map_full).fillna(gmean).to_numpy()
+            X_test_s_m2 = m2_scaler.transform(X_test)
+            p2 = mu_test + m2_full.predict(X_test_s_m2)
+            pred_norm = np.clip(w_best * p2 + (1 - w_best) * p1, 0.0, 1.0)
 
-    submission = pd.DataFrame({"row_id": row_ids, "popularity": pred_clipped})
-    submission.to_csv(f"{DATA_DIR}/submission.csv", index=False)
-    print(f"Saved submission to {DATA_DIR}/submission.csv")
+        pred_clipped = np.clip(pred_norm, 0.0, 1.0) * 100.0
+
+        submission = pd.DataFrame({"row_id": row_ids, "popularity": pred_clipped})
+        submission.to_csv(f"{DATA_DIR}/submission.csv", index=False)
+        print(f"Saved submission to {DATA_DIR}/submission.csv")
 
 
 if __name__ == "__main__":
@@ -332,6 +513,13 @@ if __name__ == "__main__":
         default="ensemble",
         choices=["ensemble", "m1", "m2"],
         help="Which model(s) to evaluate.",
+    )
+    parser.add_argument(
+        "--execution",
+        type=str,
+        default="both",
+        choices=["cv", "train", "both"],
+        help="Which stages to run: cross-validation only, full training only, or both.",
     )
     parser.add_argument("--seed", type=int, default=42, help="Seed")
     parser.add_argument("--folds", type=int, default=5, help="Number of CV folds")

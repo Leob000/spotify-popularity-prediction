@@ -5,6 +5,7 @@ SUBMIT_FILE?=submission.csv
 SUBMIT_MSG?="Submission"
 
 MODE?=ensemble # [ensemble, m1, m2]
+EXECUTION?=full # [cv, train, both]
 SEED?=42
 
 M2_M?=150.0
@@ -19,4 +20,5 @@ train:
 		--m2_m $(M2_M) \
 		--folds $(FOLDS) \
 		--mode $(MODE) \
+		--execution $(EXECUTION) \
 		--show_importance
