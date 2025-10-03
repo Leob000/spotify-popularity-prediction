@@ -1,18 +1,48 @@
 import argparse
 import time
-from typing import Dict, Optional, Tuple
+from collections import Counter
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestRegressor
+from catboost import CatBoostRegressor
+from sklearn.ensemble import (
+    ExtraTreesRegressor,
+    GradientBoostingRegressor,
+    HistGradientBoostingRegressor,
+    RandomForestRegressor,
+)
+from sklearn.linear_model import ElasticNet
 from sklearn.metrics import r2_score
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold, cross_val_score
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.pipeline import Pipeline
+from sklearn.svm import SVR
+from xgboost import XGBRegressor  # ty:ignore[possibly-unbound-import]
 
 from .data_processing import CustomColumnScaler, DataFrameTransformer
 
 TARGET = "popularity"
 GENRE = "track_genre"
 DATA_DIR = "./src/data"
+
+
+def format_params_for_logging(params: Optional[Dict[str, Any]]) -> str:
+    """Return a human-readable string for a hyperparameter mapping."""
+
+    if not params:
+        return "default parameters"
+    parts = [f"{key}={value!r}" for key, value in sorted(params.items())]
+    return ", ".join(parts)
+
+
+def parse_model_names(raw: str) -> List[str]:
+    """Parse a comma-separated list of model names."""
+
+    if not raw:
+        return []
+    return [part.strip() for part in raw.split(",") if part.strip()]
 
 
 def y_deciles(y: pd.Series, q: int = 10) -> np.ndarray:
@@ -27,6 +57,414 @@ def make_folds(y: pd.Series, n_splits: int, seed: int):
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
     dummy_X = np.zeros(len(y), dtype=int)
     return list(skf.split(dummy_X, y_bins))
+
+
+@dataclass
+class ModelSpec:
+    """Container describing how to build and tune a regression model."""
+
+    name: str
+    ctor: Callable[..., Any]
+    param_distributions: Dict[str, Any]
+    scaler_kwargs: Dict[str, Any] = field(default_factory=dict)
+
+    def instantiate(self, seed: int, params: Optional[Dict[str, Any]] = None) -> Any:
+        """Instantiate the underlying estimator with the provided params."""
+        params = params or {}
+        return self.ctor(seed=seed, **params)
+
+
+class PredefinedFoldCV:
+    """Wrap a precomputed list of folds so it can be used by sklearn CV APIs."""
+
+    def __init__(self, folds):
+        self.folds = list(folds)
+
+    def split(self, X, y=None, groups=None):
+        return iter(self.folds)
+
+    def get_n_splits(self, X=None, y=None, groups=None):
+        return len(self.folds)
+
+
+def model_specs(seed: int) -> Dict[str, ModelSpec]:
+    """Return the available model specifications keyed by short name."""
+
+    specs = {
+        "rf": ModelSpec(
+            name="rf",
+            ctor=lambda seed, **kw: RandomForestRegressor(
+                random_state=seed, n_jobs=-1, **kw
+            ),
+            param_distributions={
+                "n_estimators": [100, 300, 600],
+                "max_depth": [None, 10, 16, 24],
+                "max_features": ["sqrt", "log2", None],
+                "min_samples_leaf": [1, 2, 4],
+                "min_samples_split": [2, 5, 10],
+            },
+        ),
+        "et": ModelSpec(
+            name="et",
+            ctor=lambda seed, **kw: ExtraTreesRegressor(
+                random_state=seed, n_jobs=-1, **kw
+            ),
+            param_distributions={
+                "n_estimators": [300, 600, 1000],
+                "max_depth": [None, 12, 20, 28],
+                "max_features": ["sqrt", "log2", None],
+                "min_samples_leaf": [1, 2, 4],
+                "min_samples_split": [2, 5, 10],
+            },
+        ),
+        "hgb": ModelSpec(
+            name="hgb",
+            ctor=lambda seed, **kw: HistGradientBoostingRegressor(
+                random_state=seed, **kw
+            ),
+            param_distributions={
+                "max_depth": [None, 6, 10, 16],
+                "learning_rate": [0.03, 0.05, 0.1],
+                "max_leaf_nodes": [None, 31, 63, 127],
+                "l2_regularization": [0.0, 1e-4, 1e-3, 1e-2],
+            },
+        ),
+        "gbr": ModelSpec(
+            name="gbr",
+            ctor=lambda seed, **kw: GradientBoostingRegressor(random_state=seed, **kw),
+            param_distributions={
+                "n_estimators": [200, 400, 800],
+                "learning_rate": [0.03, 0.05, 0.1],
+                "max_depth": [2, 3, 4],
+                "subsample": [0.6, 0.8, 1.0],
+            },
+        ),
+        "enet": ModelSpec(
+            name="enet",
+            ctor=lambda seed, **kw: ElasticNet(random_state=seed, max_iter=5000, **kw),
+            param_distributions={
+                "alpha": np.logspace(-3, 1, 20),
+                "l1_ratio": np.linspace(0.0, 1.0, 11),
+            },
+            scaler_kwargs={"extend_standard_scaling": True},
+        ),
+        "svr": ModelSpec(
+            name="svr",
+            ctor=lambda seed, **kw: SVR(**kw),
+            param_distributions={
+                "C": np.logspace(-2, 2, 10),
+                "epsilon": np.logspace(-3, 0, 8),
+                "gamma": ["scale", "auto"],
+                "kernel": ["rbf"],
+            },
+            scaler_kwargs={"extend_standard_scaling": True},
+        ),
+        "knn": ModelSpec(
+            name="knn",
+            ctor=lambda seed, **kw: KNeighborsRegressor(**kw),
+            param_distributions={
+                "n_neighbors": list(range(3, 61, 2)),
+                "weights": ["uniform", "distance"],
+                "p": [1, 2],
+            },
+            scaler_kwargs={"extend_standard_scaling": True},
+        ),
+    }
+    specs["xgb"] = ModelSpec(
+        name="xgb",
+        ctor=lambda seed, **kw: XGBRegressor(
+            random_state=seed,
+            n_jobs=-1,
+            tree_method="hist",
+            verbosity=0,
+            **kw,
+        ),
+        param_distributions={
+            "n_estimators": [300, 600, 900],
+            "learning_rate": [0.03, 0.05, 0.1],
+            "max_depth": [3, 6, 9],
+            "subsample": [0.7, 0.85, 1.0],
+            "colsample_bytree": [0.6, 0.8, 1.0],
+            "min_child_weight": [1, 3, 5],
+            "reg_lambda": [0.5, 1.0, 2.0],
+            "reg_alpha": [0.0, 0.1, 0.5],
+        },
+    )
+    specs["cat"] = ModelSpec(
+        name="cat",
+        ctor=lambda seed, **kw: CatBoostRegressor(
+            random_seed=seed,
+            verbose=0,
+            allow_writing_files=False,
+            **kw,
+        ),
+        param_distributions={
+            "iterations": [500, 800, 1100],
+            "learning_rate": [0.03, 0.05, 0.08],
+            "depth": [6, 8, 10],
+            "l2_leaf_reg": [1.0, 3.0, 5.0, 7.0],
+            "bagging_temperature": [0.0, 0.25, 0.5, 1.0],
+            "subsample": [0.66, 0.8, 1.0],
+        },
+    )
+    return specs
+
+
+def choose_refit_params(
+    params_per_fold: List[Dict[str, Any]], fold_scores: List[float]
+) -> Dict[str, Any]:
+    """Aggregate per-fold best params into a single configuration for refitting.
+
+    Preference order:
+      1) Majority vote (mode) across folds for stability.
+      2) Tie-breaker: params from the outer fold with the highest R².
+      3) Fallback: the single most common params (even if frequency == 1).
+    """
+
+    if not params_per_fold:
+        return {}
+
+    counter: Counter = Counter(tuple(sorted(p.items())) for p in params_per_fold)
+    (best_items, cnt), *_ = counter.most_common(1)
+    if cnt > 1:
+        return dict(best_items)
+
+    if fold_scores and len(fold_scores) == len(params_per_fold):
+        best_idx = int(np.argmax(fold_scores))
+        return params_per_fold[best_idx]
+
+    return dict(best_items)
+
+
+def inner_cv_search(
+    spec: ModelSpec,
+    X_tr: pd.DataFrame,
+    y_tr: pd.Series,
+    n_splits: int,
+    n_iter: int,
+    seed: int,
+) -> Dict[str, Any]:
+    """
+    Randomized hyperparameter search on the provided training split.
+    If --inner-iter=0, only evaluates the defaults and skip the random search
+    """
+
+    if not spec.param_distributions:
+        return {}
+
+    inner_folds = make_folds(y_tr, n_splits=n_splits, seed=seed)
+    estimator = Pipeline(
+        [
+            (
+                "scaler",
+                CustomColumnScaler(**spec.scaler_kwargs, output_as_pandas=True),
+            ),
+            ("model", spec.instantiate(seed=seed)),
+        ]
+    )
+    param_distributions = {
+        f"model__{key}": value for key, value in spec.param_distributions.items()
+    }
+
+    # Evaluate DEFAULT hyperparameters first on the inner CV
+    default_start = time.time()
+    default_scores = cross_val_score(
+        estimator, X_tr, y_tr, scoring="r2", cv=PredefinedFoldCV(inner_folds), n_jobs=-1
+    )
+    default_mean = float(np.mean(default_scores))
+    default_elapsed = time.time() - default_start
+    print(
+        f"    Inner CV default params: mean R2={default_mean:.5f} "
+        f"(fit time={default_elapsed:.2f} sec over {n_splits} folds)",
+        flush=True,
+    )
+
+    # Randomized search for the remaining budget (if any)
+    best_params = {}
+    best_score = default_mean
+
+    effective_n_iter = max(0, int(n_iter))
+    if effective_n_iter > 0:
+        search_start = time.time()
+        search = RandomizedSearchCV(
+            estimator=estimator,
+            param_distributions=param_distributions,
+            n_iter=effective_n_iter,
+            scoring="r2",
+            cv=PredefinedFoldCV(inner_folds),
+            random_state=seed,
+            n_jobs=-1,
+            verbose=0,
+            refit=True,
+        )
+        search.fit(X_tr, y_tr)
+        elapsed = time.time() - search_start
+        print(
+            f"    Inner CV random search (n_iter={effective_n_iter}) done in {elapsed:.2f} sec "
+            f"(best_score={search.best_score_:.5f})",
+            flush=True,
+        )
+        # Keep the better of default vs. random-search best
+        if float(search.best_score_) > best_score:
+            best_score = float(search.best_score_)
+            best_params = {
+                key.replace("model__", "", 1): value
+                for key, value in search.best_params_.items()
+                if key.startswith("model__")
+            }
+    else:
+        print(
+            "    Skipping random search (n_iter=0); using default parameters.",
+            flush=True,
+        )
+
+    return best_params
+
+
+def nested_cv_oof(
+    mode: str,
+    specs: Dict[str, ModelSpec],
+    X: pd.DataFrame,
+    y: pd.Series,
+    genres: pd.Series,
+    folds,
+    seed: int,
+    inner_splits: int = 3,
+    n_iter_small: int = 20,
+    smoothing_m: float = 150.0,
+) -> Dict[str, Dict[str, Any]]:
+    """Run nested CV and collect OOF predictions per model spec."""
+
+    if mode not in {"m1", "m2"}:
+        raise ValueError("mode must be 'm1' or 'm2'")
+
+    results: Dict[str, Dict[str, Any]] = {}
+    idx = y.index
+    y_np = y.to_numpy()
+
+    n_specs = len(specs)
+    for spec_idx, (name, spec) in enumerate(specs.items(), start=1):
+        print(
+            f"Starting nested CV for spec '{name}' ({spec_idx}/{n_specs})",
+            flush=True,
+        )
+        oof = pd.Series(np.nan, index=idx, dtype=float)
+        best_params_fold: List[Dict[str, Any]] = []
+        fold_scores: List[float] = []
+
+        for fold_idx, (tr_idx, va_idx) in enumerate(folds, start=1):
+            fold_start = time.time()
+            print(
+                f"  Fold {fold_idx}/{len(folds)}: preparing data",
+                flush=True,
+            )
+            tr_ids = idx.take(tr_idx)
+            va_ids = idx.take(va_idx)
+
+            X_tr, X_va = X.loc[tr_ids], X.loc[va_ids]
+            y_tr, y_va = y.loc[tr_ids], y.loc[va_ids]
+
+            if mode == "m1":
+                y_inner_series = y_tr
+                mu_va = None
+                residual_tr = y_tr.to_numpy()
+            else:
+                inner_folds = make_folds(
+                    y_tr, n_splits=max(inner_splits, 2), seed=seed + fold_idx
+                )
+                mu_oof_train, _, _ = oof_genre_mean_with_folds(
+                    genre=genres.loc[tr_ids],
+                    y=y_tr,
+                    folds=inner_folds,
+                    m=smoothing_m,
+                )
+                residual_tr = y_tr.to_numpy() - mu_oof_train
+                y_inner_series = pd.Series(residual_tr, index=y_tr.index)
+                genre_map_full_tr, gmean_tr = compute_genre_smoothing(
+                    genre=genres.loc[tr_ids], y=y_tr, m=smoothing_m
+                )
+                mu_va = (
+                    genres.loc[va_ids]
+                    .map(genre_map_full_tr)
+                    .fillna(gmean_tr)
+                    .to_numpy()
+                )
+
+            print(
+                "    Running inner CV search "
+                f"(n_iter={n_iter_small}, inner_splits={inner_splits})",
+                flush=True,
+            )
+            best = inner_cv_search(
+                spec,
+                X_tr=X_tr,
+                y_tr=y_inner_series,
+                n_splits=inner_splits,
+                n_iter=n_iter_small,
+                seed=seed + fold_idx,
+            )
+            best_params_fold.append(best)
+
+            scaler = CustomColumnScaler(output_as_pandas=True, **spec.scaler_kwargs)
+            X_tr_s = scaler.fit_transform(X_tr)
+            X_va_s = scaler.transform(X_va)
+
+            model = spec.instantiate(seed=seed + fold_idx, params=best)
+            params_text = format_params_for_logging(best)
+            print(
+                f"    Training {model.__class__.__name__} (spec '{name}') "
+                f"fold {fold_idx}/{len(folds)} with {params_text}",
+                flush=True,
+            )
+            model.fit(X_tr_s, residual_tr if mode == "m2" else y_tr.to_numpy())
+
+            pred_va = model.predict(X_va_s)
+            if mode == "m2" and mu_va is not None:
+                pred_va = mu_va + pred_va
+
+            oof.loc[va_ids] = pred_va
+            fold_score = r2_score(y_va.to_numpy(), pred_va)
+            fold_scores.append(float(fold_score))
+            fold_elapsed = time.time() - fold_start
+            print(
+                f"  Fold {fold_idx}/{len(folds)} completed in {fold_elapsed:.2f} sec "
+                f"(R2={fold_score:.5f})",
+                flush=True,
+            )
+
+        oof_np = oof.to_numpy()
+        overall_r2 = r2_score(y_np, oof_np)
+        pf = per_fold_scores(y_np, oof_np, folds)
+        refit_params = choose_refit_params(best_params_fold, fold_scores)
+
+        results[name] = {
+            "oof": oof_np,
+            "best_params_per_fold": best_params_fold,
+            "fold_r2": fold_scores,
+            "mean_r2": float(pf.mean()),
+            "std_r2": float(pf.std()),
+            "overall_r2": float(overall_r2),
+            "refit_params": refit_params,
+        }
+        print(
+            f"[{mode.upper()}] {name}: OOF R2={overall_r2:.5f} | folds mean={pf.mean():.5f} std={pf.std():.5f}"
+        )
+        print(f"Finished nested CV for spec '{name}'.", flush=True)
+
+    return results
+
+
+def select_best_spec(
+    results: Dict[str, Dict[str, Any]],
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Return the spec name and result dict with the best overall R²."""
+
+    if not results:
+        return None, None
+    best_name, best_result = max(
+        results.items(), key=lambda item: item[1].get("overall_r2", float("-inf"))
+    )
+    return best_name, best_result
 
 
 def oof_genre_mean_with_folds(genre: pd.Series, y: pd.Series, folds, m: float = 150.0):
@@ -80,13 +518,6 @@ def oof_genre_mean_with_folds(genre: pd.Series, y: pd.Series, folds, m: float = 
     return oof.to_numpy(), smooth_full_dict, gmean
 
 
-def rf_ctor(seed):
-    """Return a configured RandomForestRegressor seeded for reproducibility."""
-    return RandomForestRegressor(
-        n_estimators=500, random_state=seed, n_jobs=-1, max_features="sqrt"
-    )
-
-
 def compute_genre_smoothing(
     genre: pd.Series,
     y: pd.Series,
@@ -110,16 +541,25 @@ def fit_full_model(
     seed: int,
     start_message: str,
     end_message_template: str,
+    scaler_kwargs: Optional[Dict[str, Any]] = None,
+    log_model_name: Optional[str] = None,
+    log_params: Optional[Dict[str, Any]] = None,
 ):
     """Fit a model on the full dataset with leakage-free scaling."""
-    scaler = CustomColumnScaler()
+    scaler_kwargs = scaler_kwargs or {}
+    scaler = CustomColumnScaler(output_as_pandas=True, **scaler_kwargs)
     X_scaled = scaler.fit_transform(X)
     model = model_ctor(seed)
-    print(start_message)
+    params_text = ""
+    if log_model_name is not None:
+        params_text = (
+            f" ({log_model_name} params: {format_params_for_logging(log_params)})"
+        )
+    print(f"{start_message}{params_text}", flush=True)
     t0 = time.time()
     model.fit(X_scaled, target)
     elapsed = time.time() - t0
-    print(end_message_template.format(elapsed=elapsed))
+    print(end_message_template.format(elapsed=elapsed), flush=True)
     return model, scaler
 
 
@@ -130,6 +570,7 @@ def oof_model_preds_with_folds(
     folds,
     seed: int,
     fit_full: bool = True,
+    scaler_kwargs: Optional[Dict[str, Any]] = None,
 ):
     """
     Generic OOF predictions for a direct y->model (no residualization) on the
@@ -148,7 +589,7 @@ def oof_model_preds_with_folds(
         X_tr, X_va = X.loc[tr_ids], X.loc[va_ids]
         y_tr = y.loc[tr_ids]
 
-        scaler = CustomColumnScaler()
+        scaler = CustomColumnScaler(output_as_pandas=True, **(scaler_kwargs or {}))
         X_tr_s = scaler.fit_transform(X_tr)
         X_va_s = scaler.transform(X_va)
 
@@ -170,6 +611,7 @@ def oof_model_preds_with_folds(
             seed=seed,
             start_message="Starting full-data model training...",
             end_message_template="Finished full-data model training in {elapsed:.2f} sec.",
+            scaler_kwargs=scaler_kwargs,
         )
 
     return oof.to_numpy(), full_model, full_scaler
@@ -183,6 +625,7 @@ def oof_residual_model_preds_with_folds(
     folds,
     seed: int,
     fit_full: bool = True,
+    scaler_kwargs: Optional[Dict[str, Any]] = None,
 ):
     """
     Out-of-fold (OOF) residual modelling with leakage-free scaling.
@@ -209,7 +652,7 @@ def oof_residual_model_preds_with_folds(
         X_tr, X_va = X.loc[tr_ids], X.loc[va_ids]
         res_tr = residual[tr_idx]
 
-        scaler = CustomColumnScaler()
+        scaler = CustomColumnScaler(output_as_pandas=True, **(scaler_kwargs or {}))
         X_tr_s = scaler.fit_transform(X_tr)
         X_va_s = scaler.transform(X_va)
 
@@ -234,6 +677,7 @@ def oof_residual_model_preds_with_folds(
             seed=seed,
             start_message="Starting full-data residual model training...",
             end_message_template="Finished full-data residual model training in {elapsed:.2f} sec.",
+            scaler_kwargs=scaler_kwargs,
         )
 
     return oof_final.to_numpy(), full_model, full_scaler
@@ -285,191 +729,291 @@ def main(args):
 
     folds = make_folds(y, n_splits=args.folds, seed=args.seed) if run_cv else None
 
-    mu_oof = None
+    specs_lookup = model_specs(args.seed)
+    m1_model_names = parse_model_names(args.m1_models)
+    m2_model_names = parse_model_names(args.m2_models)
+
+    if args.mode in ("m1", "ensemble") and not m1_model_names:
+        raise ValueError("Provide at least one model spec via --m1-models for M1.")
+    if args.mode in ("m2", "ensemble") and not m2_model_names:
+        raise ValueError("Provide at least one model spec via --m2-models for M2.")
+
+    def resolve_specs(names: List[str]) -> Dict[str, ModelSpec]:
+        selected: Dict[str, ModelSpec] = {}
+        for name in names:
+            if name not in specs_lookup:
+                available = ", ".join(sorted(specs_lookup.keys()))
+                raise ValueError(
+                    f"Unknown model spec '{name}'. Available specs: {available}"
+                )
+            selected[name] = specs_lookup[name]
+        return selected
+
+    selected_m1_specs = (
+        resolve_specs(m1_model_names) if args.mode in ("m1", "ensemble") else {}
+    )
+    selected_m2_specs = (
+        resolve_specs(m2_model_names) if args.mode in ("m2", "ensemble") else {}
+    )
+
+    mu_oof: Optional[np.ndarray] = None
     genre_map_full: Optional[Dict[str, float]] = None
     gmean: Optional[float] = None
 
-    oof_m1 = None
+    oof_m1: Optional[np.ndarray] = None
+    oof_m2: Optional[np.ndarray] = None
+
+    r2_m1: Optional[float] = None
+    r2_m2: Optional[float] = None
+    r2_blend: Optional[float] = None
+    r2_mu_only: Optional[float] = None
+
+    pf_m1_stats: Optional[Tuple[float, float]] = None
+    pf_m2_stats: Optional[Tuple[float, float]] = None
+    pf_blend: Optional[np.ndarray] = None
+
+    best_m1_spec: Optional[ModelSpec] = None
+    best_m1_spec_name: Optional[str] = None
+    best_m1_params: Dict[str, Any] = {}
+
+    best_m2_spec: Optional[ModelSpec] = None
+    best_m2_spec_name: Optional[str] = None
+    best_m2_params: Dict[str, Any] = {}
+
     m1_full = None
     m1_scaler = None
-    r2_m1 = None
-    pf_m1 = None
-
-    oof_m2 = None
     m2_full = None
     m2_scaler = None
-    r2_m2 = None
-    pf_m2 = None
-    r2_mu_only = None
+    w_best: Optional[float] = None
+    mu_train: Optional[np.ndarray] = None
 
-    w_best = None
-    r2_blend = None
-    pf_blend = None
-
+    ensemble_strategy: Optional[str] = None
     if run_cv:
+        y_np = y.to_numpy()
+
         if args.mode in ("m2", "ensemble"):
             mu_oof, genre_map_full_cv, gmean_cv = oof_genre_mean_with_folds(
                 genre=genres, y=y, folds=folds, m=args.m2_m
             )
             genre_map_full = genre_map_full_cv
             gmean = gmean_cv
-            r2_mu_only = r2_score(y, mu_oof)
-            oof_m2, m2_full_cv, m2_scaler_cv = oof_residual_model_preds_with_folds(
-                rf_ctor,
-                X,
-                y,
-                mu_oof=mu_oof,
+            r2_mu_only = r2_score(y_np, mu_oof)
+            nested_results_m2 = nested_cv_oof(
+                mode="m2",
+                specs=selected_m2_specs,
+                X=X,
+                y=y,
+                genres=genres,
                 folds=folds,
                 seed=args.seed,
-                fit_full=run_train,
+                inner_splits=args.inner_splits,
+                n_iter_small=args.inner_iter,
+                smoothing_m=args.m2_m,
             )
-            r2_m2 = r2_score(y, oof_m2)
-            pf_m2 = per_fold_scores(y.to_numpy(), oof_m2, folds)
-            if run_train:
-                m2_full = m2_full_cv
-                m2_scaler = m2_scaler_cv
+            best_m2_spec_name, best_m2_result = select_best_spec(nested_results_m2)
+            if best_m2_result is not None and best_m2_spec_name is not None:
+                best_m2_spec = selected_m2_specs[best_m2_spec_name]
+                best_m2_params = best_m2_result.get("refit_params", {})
+                oof_m2 = best_m2_result["oof"]
+                r2_m2 = best_m2_result["overall_r2"]
+                pf_m2_stats = (
+                    best_m2_result["mean_r2"],
+                    best_m2_result["std_r2"],
+                )
+
         if args.mode in ("m1", "ensemble"):
-            oof_m1, m1_full_cv, m1_scaler_cv = oof_model_preds_with_folds(
-                rf_ctor,
-                X,
-                y,
+            nested_results_m1 = nested_cv_oof(
+                mode="m1",
+                specs=selected_m1_specs,
+                X=X,
+                y=y,
+                genres=genres,
                 folds=folds,
                 seed=args.seed,
-                fit_full=run_train,
+                inner_splits=args.inner_splits,
+                n_iter_small=args.inner_iter,
+                smoothing_m=args.m2_m,
             )
-            r2_m1 = r2_score(y, oof_m1)
-            pf_m1 = per_fold_scores(y.to_numpy(), oof_m1, folds)
-            if run_train:
-                m1_full = m1_full_cv
-                m1_scaler = m1_scaler_cv
-        if args.mode == "ensemble":
-            if oof_m1 is None or oof_m2 is None:
-                raise ValueError("Ensemble mode requires both M1 and M2 predictions.")
-            w_best, _ = best_blend_weight(
-                y_true=y.to_numpy(), p1=oof_m1, p2=oof_m2, step=0.01
-            )
+            best_m1_spec_name, best_m1_result = select_best_spec(nested_results_m1)
+            if best_m1_result is not None and best_m1_spec_name is not None:
+                best_m1_spec = selected_m1_specs[best_m1_spec_name]
+                best_m1_params = best_m1_result.get("refit_params", {})
+                oof_m1 = best_m1_result["oof"]
+                r2_m1 = best_m1_result["overall_r2"]
+                pf_m1_stats = (
+                    best_m1_result["mean_r2"],
+                    best_m1_result["std_r2"],
+                )
+
+        if args.mode == "ensemble" and oof_m1 is not None and oof_m2 is not None:
+            w_best, _ = best_blend_weight(y_true=y_np, p1=oof_m1, p2=oof_m2, step=0.01)
             oof_blend = np.clip(w_best * oof_m2 + (1 - w_best) * oof_m1, 0.0, 1.0)
-            r2_blend = r2_score(y, oof_blend)
-            pf_blend = per_fold_scores(y.to_numpy(), oof_blend, folds)
+            r2_blend = r2_score(y_np, oof_blend)
+            pf_blend = per_fold_scores(y_np, oof_blend, folds)
+            # Select best inference strategy based on OOF R²
+            candidates = [("m1", r2_m1), ("m2", r2_m2), ("blend", r2_blend)]
+            ensemble_strategy = max(
+                candidates, key=lambda x: (x[1] if x[1] is not None else -np.inf)
+            )[0]
 
         if args.mode == "m1":
             print("Mode: M1 (no-genre) — Cross-validated (OOF) results")
-            if r2_m1 is not None and pf_m1 is not None:
+            if best_m1_spec_name:
+                print(f"Best spec: {best_m1_spec_name}")
+                if best_m1_params:
+                    print(f"Refit params: {best_m1_params}")
+            if r2_m1 is not None and pf_m1_stats is not None:
+                mean_r2, std_r2 = pf_m1_stats
                 print(
-                    f"OOF R2 M1: {r2_m1:.5f}  | folds mean={pf_m1.mean():.5f} std={pf_m1.std():.5f}"
-                )
-            if run_train and args.show_importance and m1_full is not None:
-                print_feature_importance(
-                    m1_full, X.columns, model_name="M1 (full-data)"
+                    f"OOF R2 M1 ({best_m1_spec_name}): {r2_m1:.5f}  | folds mean={mean_r2:.5f} std={std_r2:.5f}"
                 )
         elif args.mode == "m2":
             print("Mode: M2 (genre-residual) — Cross-validated (OOF) results")
+            if best_m2_spec_name:
+                print(f"Best spec: {best_m2_spec_name}")
+                if best_m2_params:
+                    print(f"Refit params: {best_m2_params}")
             if r2_mu_only is not None:
                 print(f"OOF R2 genre-only baseline (mu_genre): {r2_mu_only:.5f}")
-            if r2_m2 is not None and pf_m2 is not None:
+            if r2_m2 is not None and pf_m2_stats is not None:
+                mean_r2, std_r2 = pf_m2_stats
                 print(
-                    f"OOF R2 M2 (mu_genre + residual RF):   {r2_m2:.5f}  | folds mean={pf_m2.mean():.5f} std={pf_m2.std():.5f}"
-                )
-            if run_train and args.show_importance and m2_full is not None:
-                print_feature_importance(
-                    m2_full, X.columns, model_name="M2 residual (full-data)"
+                    f"OOF R2 M2 ({best_m2_spec_name}): {r2_m2:.5f}  | folds mean={mean_r2:.5f} std={std_r2:.5f}"
                 )
         else:
             print("Mode: ENSEMBLE (M1 + M2) — Cross-validated (OOF) results")
+            if best_m1_spec_name:
+                print(f"Best M1 spec: {best_m1_spec_name}")
+            if best_m2_spec_name:
+                print(f"Best M2 spec: {best_m2_spec_name}")
             if w_best is not None:
                 print(
                     f"Learned blend weight w on OOF (p = w*M2 + (1-w)*M1): {w_best:.2f}"
                 )
-            if r2_m1 is not None:
-                print(f"OOF R2 M1:      {r2_m1:.5f}")
-            if r2_m2 is not None:
-                print(f"OOF R2 M2:      {r2_m2:.5f}")
+            if r2_m1 is not None and pf_m1_stats is not None:
+                mean_r2, std_r2 = pf_m1_stats
+                print(
+                    f"OOF R2 M1 ({best_m1_spec_name}): {r2_m1:.5f}  | folds mean={mean_r2:.5f} std={std_r2:.5f}"
+                )
+            if r2_m2 is not None and pf_m2_stats is not None:
+                mean_r2, std_r2 = pf_m2_stats
+                print(
+                    f"OOF R2 M2 ({best_m2_spec_name}): {r2_m2:.5f}  | folds mean={mean_r2:.5f} std={std_r2:.5f}"
+                )
             if r2_blend is not None and pf_blend is not None:
                 print(
                     f"OOF R2 BLEND:   {r2_blend:.5f}  | folds mean={pf_blend.mean():.5f} std={pf_blend.std():.5f}"
                 )
             if r2_mu_only is not None:
                 print(f"(For reference) OOF R2 mu_genre baseline: {r2_mu_only:.5f}")
-            if run_train and args.show_importance:
-                if m1_full is not None:
-                    print_feature_importance(
-                        m1_full, X.columns, model_name="M1 (full-data)"
-                    )
-                if m2_full is not None:
-                    print_feature_importance(
-                        m2_full, X.columns, model_name="M2 residual (full-data)"
-                    )
+            if ensemble_strategy is not None:
+                print(f"Selected inference strategy: {ensemble_strategy}")
 
     if run_train:
-        if not run_cv:
-            if args.mode in ("m2", "ensemble"):
+        if args.mode in ("m2", "ensemble"):
+            if best_m2_spec is None and selected_m2_specs:
+                fallback_name = m2_model_names[0]
+                best_m2_spec = selected_m2_specs[fallback_name]
+                best_m2_spec_name = fallback_name
+                best_m2_params = {}
+                if not run_cv:
+                    print(
+                        f"Train-only execution: defaulting M2 to '{fallback_name}' with baseline params."
+                    )
+            if best_m2_spec is None:
+                raise ValueError("No model spec available for M2 training.")
+            if genre_map_full is None or gmean is None:
                 genre_map_full, gmean = compute_genre_smoothing(
                     genre=genres, y=y, m=args.m2_m
                 )
-                mu_train = genres.map(genre_map_full).fillna(gmean).to_numpy()
-                m2_full, m2_scaler = fit_full_model(
-                    model_ctor=rf_ctor,
-                    X=X,
-                    target=y.to_numpy() - mu_train,
-                    seed=args.seed,
-                    start_message="Starting full-data residual model training...",
-                    end_message_template=(
-                        "Finished full-data residual model training in {elapsed:.2f} sec."
-                    ),
-                )
-            else:
-                mu_train = None
-            if args.mode in ("m1", "ensemble"):
-                m1_full, m1_scaler = fit_full_model(
-                    model_ctor=rf_ctor,
-                    X=X,
-                    target=y.to_numpy(),
-                    seed=args.seed,
-                    start_message="Starting full-data model training...",
-                    end_message_template=(
-                        "Finished full-data model training in {elapsed:.2f} sec."
-                    ),
-                )
-            if args.mode == "ensemble" and genre_map_full is None:
-                genre_map_full, gmean = compute_genre_smoothing(
-                    genre=genres, y=y, m=args.m2_m
-                )
-        elif args.mode in ("m2", "ensemble") and genre_map_full is None:
-            genre_map_full, gmean = compute_genre_smoothing(
-                genre=genres, y=y, m=args.m2_m
+            mu_train = genres.map(genre_map_full).fillna(gmean).to_numpy()
+
+            def m2_ctor(seed: int, spec=best_m2_spec, params=best_m2_params):
+                return spec.instantiate(seed=seed, params=params)
+
+            m2_full, m2_scaler = fit_full_model(
+                model_ctor=m2_ctor,
+                X=X,
+                target=y.to_numpy() - mu_train,
+                seed=args.seed,
+                start_message="Starting full-data residual model training...",
+                end_message_template=(
+                    "Finished full-data residual model training in {elapsed:.2f} sec."
+                ),
+                scaler_kwargs=best_m2_spec.scaler_kwargs,
+                log_model_name=best_m2_spec_name or best_m2_spec.name,
+                log_params=best_m2_params,
+            )
+        else:
+            mu_train = None
+
+        if args.mode in ("m1", "ensemble"):
+            if best_m1_spec is None and selected_m1_specs:
+                fallback_name = m1_model_names[0]
+                best_m1_spec = selected_m1_specs[fallback_name]
+                best_m1_spec_name = fallback_name
+                best_m1_params = {}
+                if not run_cv:
+                    print(
+                        f"Train-only execution: defaulting M1 to '{fallback_name}' with baseline params."
+                    )
+            if best_m1_spec is None:
+                raise ValueError("No model spec available for M1 training.")
+
+            def m1_ctor(seed: int, spec=best_m1_spec, params=best_m1_params):
+                return spec.instantiate(seed=seed, params=params)
+
+            m1_full, m1_scaler = fit_full_model(
+                model_ctor=m1_ctor,
+                X=X,
+                target=y.to_numpy(),
+                seed=args.seed,
+                start_message="Starting full-data model training...",
+                end_message_template=(
+                    "Finished full-data model training in {elapsed:.2f} sec."
+                ),
+                scaler_kwargs=best_m1_spec.scaler_kwargs,
+                log_model_name=best_m1_spec_name or best_m1_spec.name,
+                log_params=best_m1_params,
             )
 
         if args.mode == "ensemble" and w_best is None:
+            if genre_map_full is None or gmean is None:
+                genre_map_full, gmean = compute_genre_smoothing(
+                    genre=genres, y=y, m=args.m2_m
+                )
             train_mu = genres.map(genre_map_full).fillna(gmean).to_numpy()
-            assert m1_full is not None and m1_scaler is not None
-            assert m2_full is not None and m2_scaler is not None
-            X_train_s_m1 = m1_scaler.transform(X)
-            p1_train = m1_full.predict(X_train_s_m1)
-            X_train_s_m2 = m2_scaler.transform(X)
-            p2_train = train_mu + m2_full.predict(X_train_s_m2)
+            if m1_full is None or m2_full is None:
+                raise ValueError("Full models unavailable for computing blend weight.")
+            X_train_m1 = m1_scaler.transform(X) if m1_scaler is not None else X
+            p1_train = m1_full.predict(X_train_m1)
+            X_train_m2 = m2_scaler.transform(X) if m2_scaler is not None else X
+            p2_train = train_mu + m2_full.predict(X_train_m2)
             w_best, _ = best_blend_weight(
                 y_true=y.to_numpy(), p1=p1_train, p2=p2_train, step=0.01
             )
             print(f"Computed blend weight on training data: {w_best:.2f}")
 
-        if args.show_importance and not run_cv:
+        if args.show_importance:
             if args.mode in ("m1", "ensemble") and m1_full is not None:
-                print_feature_importance(
-                    m1_full, X.columns, model_name="M1 (full-data)"
-                )
+                model_name = "M1"
+                if best_m1_spec_name:
+                    model_name += f" ({best_m1_spec_name}, full-data)"
+                print_feature_importance(m1_full, X.columns, model_name=model_name)
             if args.mode in ("m2", "ensemble") and m2_full is not None:
-                print_feature_importance(
-                    m2_full, X.columns, model_name="M2 residual (full-data)"
-                )
+                model_name = "M2 residual"
+                if best_m2_spec_name:
+                    model_name += f" ({best_m2_spec_name}, full-data)"
+                print_feature_importance(m2_full, X.columns, model_name=model_name)
 
         test_df = df_transformer.transform(pd.read_csv(f"{DATA_DIR}/test_data.csv"))
         row_ids = test_df.index.to_numpy()
         X_test = test_df.drop(columns=[TARGET, GENRE], errors="ignore")
 
         if args.mode == "m1":
-            if m1_scaler is None or m1_full is None:
+            if m1_full is None:
                 raise ValueError("M1 full model not available for inference.")
-            X_test_s = m1_scaler.transform(X_test)
+            X_test_s = m1_scaler.transform(X_test) if m1_scaler is not None else X_test
             pred_norm = m1_full.predict(X_test_s)
         elif args.mode == "m2":
             if genre_map_full is None or gmean is None:
@@ -477,29 +1021,55 @@ def main(args):
                     genre=genres, y=y, m=args.m2_m
                 )
             mu_test = test_df[GENRE].map(genre_map_full).fillna(gmean).to_numpy()
-            if m2_scaler is None or m2_full is None:
+            if m2_full is None:
                 raise ValueError("M2 full model not available for inference.")
-            X_test_s = m2_scaler.transform(X_test)
+            X_test_s = m2_scaler.transform(X_test) if m2_scaler is not None else X_test
             res_pred = m2_full.predict(X_test_s)
             pred_norm = mu_test + res_pred
         else:
-            if w_best is None:
-                raise ValueError("Blend weight unavailable for ensemble inference.")
-            if (
-                m1_scaler is None
-                or m1_full is None
-                or m2_scaler is None
-                or m2_full is None
-                or genre_map_full is None
-                or gmean is None
-            ):
-                raise ValueError("Full models not available for ensemble inference.")
-            X_test_s_m1 = m1_scaler.transform(X_test)
-            p1 = m1_full.predict(X_test_s_m1)
-            mu_test = test_df[GENRE].map(genre_map_full).fillna(gmean).to_numpy()
-            X_test_s_m2 = m2_scaler.transform(X_test)
-            p2 = mu_test + m2_full.predict(X_test_s_m2)
-            pred_norm = np.clip(w_best * p2 + (1 - w_best) * p1, 0.0, 1.0)
+            # In ENSEMBLE mode, use the strategy selected on OOF (if available).
+            if ensemble_strategy == "m1":
+                if m1_full is None:
+                    raise ValueError(
+                        "M1 full model not available for ensemble inference."
+                    )
+                X_test_s_m1 = (
+                    m1_scaler.transform(X_test) if m1_scaler is not None else X_test
+                )
+                pred_norm = m1_full.predict(X_test_s_m1)
+            elif ensemble_strategy == "m2":
+                if m2_full is None or genre_map_full is None or gmean is None:
+                    raise ValueError(
+                        "M2 full model or genre mapping unavailable for ensemble inference."
+                    )
+                mu_test = test_df[GENRE].map(genre_map_full).fillna(gmean).to_numpy()
+                X_test_s_m2 = (
+                    m2_scaler.transform(X_test) if m2_scaler is not None else X_test
+                )
+                res_pred = m2_full.predict(X_test_s_m2)
+                pred_norm = mu_test + res_pred
+            else:
+                # Default to blending when no strategy was selected via CV
+                if (
+                    w_best is None
+                    or m1_full is None
+                    or m2_full is None
+                    or genre_map_full is None
+                    or gmean is None
+                ):
+                    raise ValueError(
+                        "Ensemble inference requires fitted models and blend weight."
+                    )
+                X_test_s_m1 = (
+                    m1_scaler.transform(X_test) if m1_scaler is not None else X_test
+                )
+                p1 = m1_full.predict(X_test_s_m1)
+                mu_test = test_df[GENRE].map(genre_map_full).fillna(gmean).to_numpy()
+                X_test_s_m2 = (
+                    m2_scaler.transform(X_test) if m2_scaler is not None else X_test
+                )
+                p2 = mu_test + m2_full.predict(X_test_s_m2)
+                pred_norm = np.clip(w_best * p2 + (1 - w_best) * p1, 0.0, 1.0)
 
         pred_clipped = np.clip(pred_norm, 0.0, 1.0) * 100.0
 
@@ -527,13 +1097,43 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42, help="Seed")
     parser.add_argument("--folds", type=int, default=5, help="Number of CV folds")
     parser.add_argument(
-        "--m2_m",
+        "--m1-models",
+        type=str,
+        default="rf",
+        help=(
+            "Comma-separated model specs to evaluate for M1 (no-genre). "
+            "Available options: rf, et, hgb, gbr, enet, svr, knn, xgb, cat."
+        ),
+    )
+    parser.add_argument(
+        "--m2-models",
+        type=str,
+        default="rf",
+        help=(
+            "Comma-separated model specs to evaluate for M2 (genre-residual). "
+            "Available options: rf, et, hgb, gbr, enet, svr, knn, xgb, cat."
+        ),
+    )
+    parser.add_argument(
+        "--inner-splits",
+        type=int,
+        default=3,
+        help="Number of inner CV splits for hyperparameter search.",
+    )
+    parser.add_argument(
+        "--inner-iter",
+        type=int,
+        default=20,
+        help="Number of RandomizedSearch iterations per model spec.",
+    )
+    parser.add_argument(
+        "--m2-m",
         type=float,
         default=150.0,
         help="m hyperparameter for genre-mean smoothing",
     )
     parser.add_argument(
-        "--show_importance",
+        "--show-importance",
         action="store_true",
         help="Print top-20 feature importances from full-data models",
     )
