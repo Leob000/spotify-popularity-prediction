@@ -1,4 +1,6 @@
 import argparse
+import os
+import sys
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -308,7 +310,9 @@ def inner_cv_search(
 
     candidate_params = candidate_params or []
     for idx, candidate in enumerate(candidate_params, start=1):
-        candidate_prefixed = {f"model__{key}": value for key, value in candidate.items()}
+        candidate_prefixed = {
+            f"model__{key}": value for key, value in candidate.items()
+        }
         candidate_estimator = clone(estimator)
         if candidate_prefixed:
             candidate_estimator.set_params(**candidate_prefixed)
@@ -366,9 +370,7 @@ def inner_cv_search(
     else:
         message = "    Random search disabled; using evaluated candidates/default."
         if enable_random_search and effective_n_iter == 0:
-            message = (
-                "    Skipping random search (n_iter=0); using evaluated candidates/default."
-            )
+            message = "    Skipping random search (n_iter=0); using evaluated candidates/default."
         print(message, flush=True)
 
     return best_params
@@ -921,7 +923,12 @@ def print_feature_importance(model, feature_names, model_name):
 def main(args):
     """Execute the training and evaluation workflow based on parsed CLI args."""
     df_transformer = DataFrameTransformer()
-    df = df_transformer.transform(pd.read_csv(f"{DATA_DIR}/train_data.csv"))
+
+    train_path = os.path.join(DATA_DIR, "train_data.csv")
+    if not os.path.exists(train_path):
+        print(f"Train data not found. Please place `train_data.csv` at `{train_path}`")
+        sys.exit(1)
+    df = df_transformer.transform(pd.read_csv(train_path))
 
     y = df[TARGET]
     genres = df[GENRE]
@@ -1097,13 +1104,10 @@ def main(args):
                     )
 
             best_m2_spec_name, best_m2_result = select_best_spec(nested_results_m2)
-            if (
-                m2_blend_candidate is not None
-                and (
-                    best_m2_result is None
-                    or m2_blend_candidate["overall_r2"]
-                    > best_m2_result.get("overall_r2", float("-inf"))
-                )
+            if m2_blend_candidate is not None and (
+                best_m2_result is None
+                or m2_blend_candidate["overall_r2"]
+                > best_m2_result.get("overall_r2", float("-inf"))
             ):
                 m2_selection_type = "blend"
                 best_m2_spec = None
@@ -1212,9 +1216,7 @@ def main(args):
                             f"refit_m={boost_component['refit_m']}"
                         )
                     if m2_blend_weight is not None:
-                        print(
-                            f"  blend weight (boost share)={m2_blend_weight:.2f}"
-                        )
+                        print(f"  blend weight (boost share)={m2_blend_weight:.2f}")
                 elif best_m2_params:
                     print(f"Refit params: {best_m2_params}")
             if r2_mu_only is not None:
@@ -1244,9 +1246,7 @@ def main(args):
                             f"refit_m={boost_component['refit_m']}"
                         )
                     if m2_blend_weight is not None:
-                        print(
-                            f"  blend weight (boost share)={m2_blend_weight:.2f}"
-                        )
+                        print(f"  blend weight (boost share)={m2_blend_weight:.2f}")
                 elif best_m2_params:
                     print(f"  Refit params: {best_m2_params}")
             if w_best is not None:
@@ -1293,12 +1293,12 @@ def main(args):
                     mu_train_comp = genres.map(genre_map).fillna(comp_gmean).to_numpy()
                     component["mu_train"] = mu_train_comp
 
-                    def ctor(seed: int, spec=component["spec"], params=component["params"]):
+                    def ctor(
+                        seed: int, spec=component["spec"], params=component["params"]
+                    ):
                         return spec.instantiate(seed=seed, params=params)
 
-                    start_msg = (
-                        f"Starting full-data residual model training ({comp_key}: {component['name']})..."
-                    )
+                    start_msg = f"Starting full-data residual model training ({comp_key}: {component['name']})..."
                     end_msg = (
                         "Finished full-data residual model training "
                         f"({comp_key}: {component['name']}) in {{elapsed:.2f}} sec."
@@ -1320,7 +1320,9 @@ def main(args):
                 train_component("bagging")
                 train_component("boosting")
 
-                def predict_component(comp_key: str, X_frame: pd.DataFrame, genre_series: pd.Series) -> np.ndarray:
+                def predict_component(
+                    comp_key: str, X_frame: pd.DataFrame, genre_series: pd.Series
+                ) -> np.ndarray:
                     component = best_m2_components[comp_key]
                     scaler_obj = component.get("scaler")
                     X_scaled = (
@@ -1339,7 +1341,10 @@ def main(args):
                 bag_pred_train = predict_component("bagging", X, genres)
                 boost_pred_train = predict_component("boosting", X, genres)
                 m2_blend_weight, _ = best_blend_weight(
-                    y_true=y.to_numpy(), p1=bag_pred_train, p2=boost_pred_train, step=0.01
+                    y_true=y.to_numpy(),
+                    p1=bag_pred_train,
+                    p2=boost_pred_train,
+                    step=0.01,
                 )
                 print(
                     f"Computed M2 blend weight on training data (boost share): {m2_blend_weight:.2f}",
@@ -1443,21 +1448,22 @@ def main(args):
 
                 bag_pred = component_prediction("bagging")
                 boost_pred = component_prediction("boosting")
-                return (
-                    m2_blend_weight * boost_pred
-                    + (1.0 - m2_blend_weight) * bag_pred
-                )
+                return m2_blend_weight * boost_pred + (1.0 - m2_blend_weight) * bag_pred
 
             if genre_map_full is None or gmean is None or m2_full is None:
                 raise ValueError("M2 model unavailable for prediction.")
             mu_vals = genre_series.map(genre_map_full).fillna(gmean).to_numpy()
-            X_scaled = m2_scaler.transform(X_frame) if m2_scaler is not None else X_frame
+            X_scaled = (
+                m2_scaler.transform(X_frame) if m2_scaler is not None else X_frame
+            )
             residual_pred = m2_full.predict(X_scaled)
             return mu_vals + residual_pred
 
         if args.mode == "ensemble" and w_best is None:
             if m1_full is None:
-                raise ValueError("M1 full model unavailable for computing blend weight.")
+                raise ValueError(
+                    "M1 full model unavailable for computing blend weight."
+                )
             X_train_m1 = m1_scaler.transform(X) if m1_scaler is not None else X
             p1_train = m1_full.predict(X_train_m1)
 
@@ -1478,9 +1484,7 @@ def main(args):
                         "M2 full model unavailable for computing blend weight."
                     )
                 train_mu = genres.map(genre_map_full).fillna(gmean).to_numpy()
-                X_train_m2 = (
-                    m2_scaler.transform(X) if m2_scaler is not None else X
-                )
+                X_train_m2 = m2_scaler.transform(X) if m2_scaler is not None else X
                 p2_train = train_mu + m2_full.predict(X_train_m2)
             w_best, _ = best_blend_weight(
                 y_true=y.to_numpy(), p1=p1_train, p2=p2_train, step=0.01
@@ -1501,7 +1505,9 @@ def main(args):
                             continue
                         model_name = "M2 residual"
                         if component.get("name"):
-                            model_name += f" ({component['name']}, full-data, {comp_key})"
+                            model_name += (
+                                f" ({component['name']}, full-data, {comp_key})"
+                            )
                         print_feature_importance(
                             model_obj, X.columns, model_name=model_name
                         )
@@ -1511,7 +1517,11 @@ def main(args):
                         model_name += f" ({best_m2_spec_name}, full-data)"
                     print_feature_importance(m2_full, X.columns, model_name=model_name)
 
-        test_df = df_transformer.transform(pd.read_csv(f"{DATA_DIR}/test_data.csv"))
+        test_path = os.path.join(DATA_DIR, "test_data.csv")
+        if not os.path.exists(test_path):
+            print(f"Test data not found. Please place `test_data.csv` at `{test_path}`")
+            sys.exit(1)
+        test_df = df_transformer.transform(pd.read_csv(test_path))
         row_ids = test_df.index.to_numpy()
         X_test = test_df.drop(columns=[TARGET, GENRE], errors="ignore")
 

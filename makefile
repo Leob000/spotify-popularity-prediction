@@ -17,6 +17,9 @@ M2_MODELS?="rf, et, xgb, cat" # [rf, et, hgb, gbr, enet, svr, knn, xgb, cat]
 INNER_SPLITS?=3
 INNER_ITER?=20
 
+REPRO_M1_MODELS?="rf, et, xgb, cat"
+REPRO_M2_MODELS?="rf, et, xgb, cat"
+
 submit:
 	kaggle competitions submit -c spotify-predire-la-popularite-dun-titre -f $(DATA_DIR)$(SUBMIT_FILE) -m $(SUBMIT_MSG)
 
@@ -34,10 +37,24 @@ train:
 		--m2-blend-bag-boost \
 		--show-importance
 
-m_search:
+repro_results:
 	$(PY) -m src.modelling.train \
-		--seed $(SEED) \
-		--m2-m $(M2_M) \
+		--seed 42 \
+		--m2-m 300.0 \
+		--folds 5 \
+		--mode ensemble \
+		--execution both \
+		--m1-models $(REPRO_M1_MODELS) \
+		--m2-models $(REPRO_M2_MODELS) \
+		--inner-splits 3 \
+		--inner-iter 20 \
+		--m2-blend-bag-boost \
+		--show-importance
+
+repro_m_search:
+	$(PY) -m src.modelling.train \
+		--seed 42 \
+		--m2-m 150.0 \
 		--m2-m-grid $(M2_M_GRID) \
 		--folds 10 \
 		--mode ensemble \
