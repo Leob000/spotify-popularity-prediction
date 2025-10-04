@@ -15,7 +15,7 @@ FOLDS?=5
 M1_MODELS?="rf" # [rf, et, hgb, gbr, enet, svr, knn, xgb, cat]
 M2_MODELS?="rf" # [rf, et, hgb, gbr, enet, svr, knn, xgb, cat]
 INNER_SPLITS?=3
-INNER_ITER?=0
+INNER_ITER?=1
 
 submit:
 	kaggle competitions submit -c spotify-predire-la-popularite-dun-titre -f $(DATA_DIR)$(SUBMIT_FILE) -m $(SUBMIT_MSG)

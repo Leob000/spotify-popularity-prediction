@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from catboost import CatBoostRegressor
+from sklearn.base import clone
 from sklearn.ensemble import (
     ExtraTreesRegressor,
     GradientBoostingRegressor,
@@ -256,10 +257,17 @@ def inner_cv_search(
     n_splits: int,
     n_iter: int,
     seed: int,
+    candidate_params: Optional[List[Dict[str, Any]]] = None,
+    enable_random_search: bool = True,
 ) -> Dict[str, Any]:
     """
     Randomized hyperparameter search on the provided training split.
-    If --inner-iter=0, only evaluates the defaults and skip the random search
+    If --inner-iter=0, only evaluates the defaults and skip the random search.
+
+    When `candidate_params` are provided, each parameter mapping is evaluated
+    via cross-validation (together with the defaults) before deciding whether to
+    trigger the randomized search. Set `enable_random_search=False` to reuse the
+    provided candidates without sampling new configurations.
     """
 
     if not spec.param_distributions:
@@ -296,8 +304,36 @@ def inner_cv_search(
     best_params = {}
     best_score = default_mean
 
+    candidate_params = candidate_params or []
+    for idx, candidate in enumerate(candidate_params, start=1):
+        candidate_prefixed = {f"model__{key}": value for key, value in candidate.items()}
+        candidate_estimator = clone(estimator)
+        if candidate_prefixed:
+            candidate_estimator.set_params(**candidate_prefixed)
+        candidate_start = time.time()
+        candidate_scores = cross_val_score(
+            candidate_estimator,
+            X_tr,
+            y_tr,
+            scoring="r2",
+            cv=PredefinedFoldCV(inner_folds),
+            n_jobs=-1,
+        )
+        candidate_mean = float(np.mean(candidate_scores))
+        candidate_elapsed = time.time() - candidate_start
+        print(
+            f"    Inner CV candidate params {idx}/{len(candidate_params)}: "
+            f"mean R2={candidate_mean:.5f} "
+            f"(fit time={candidate_elapsed:.2f} sec over {n_splits} folds) "
+            f"{format_params_for_logging(candidate)}",
+            flush=True,
+        )
+        if candidate_mean > best_score:
+            best_score = candidate_mean
+            best_params = dict(candidate)
+
     effective_n_iter = max(0, int(n_iter))
-    if effective_n_iter > 0:
+    if enable_random_search and effective_n_iter > 0:
         search_start = time.time()
         search = RandomizedSearchCV(
             estimator=estimator,
@@ -326,10 +362,12 @@ def inner_cv_search(
                 if key.startswith("model__")
             }
     else:
-        print(
-            "    Skipping random search (n_iter=0); using default parameters.",
-            flush=True,
-        )
+        message = "    Random search disabled; using evaluated candidates/default."
+        if enable_random_search and effective_n_iter == 0:
+            message = (
+                "    Skipping random search (n_iter=0); using evaluated candidates/default."
+            )
+        print(message, flush=True)
 
     return best_params
 
@@ -345,8 +383,28 @@ def nested_cv_oof(
     inner_splits: int = 3,
     n_iter_small: int = 20,
     m_grid: Optional[List[float]] = None,
+    candidate_param_sets: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    enable_random_search: bool = True,
 ) -> Dict[str, Dict[str, Any]]:
-    """Run nested CV and collect OOF predictions per model spec."""
+    """Run nested CV and collect OOF predictions per model spec.
+
+    Args:
+        mode: Either "m1" or "m2".
+        specs: Mapping of model name to its `ModelSpec` definition.
+        X: Feature matrix for training.
+        y: Target series.
+        genres: Genre column used by the M2 workflow.
+        folds: Iterable of (train_idx, valid_idx) tuples for outer CV.
+        seed: Base random seed used across folds.
+        inner_splits: Number of inner CV splits.
+        n_iter_small: Random search iterations for inner CV.
+        m_grid: Optional list of smoothing values when mode == "m2".
+        candidate_param_sets: Optional mapping of spec name -> list of parameter
+            dictionaries to evaluate alongside defaults (primarily used to reuse
+            the best params discovered in M2 when running M1).
+        enable_random_search: When False, skip randomized search and rely solely
+            on the defaults plus `candidate_param_sets`.
+    """
 
     if mode not in {"m1", "m2"}:
         raise ValueError("mode must be 'm1' or 'm2'")
@@ -354,6 +412,7 @@ def nested_cv_oof(
     results: Dict[str, Dict[str, Any]] = {}
     idx = y.index
     y_np = y.to_numpy()
+    candidate_param_sets = candidate_param_sets or {}
 
     n_specs = len(specs)
     for spec_idx, (name, spec) in enumerate(specs.items(), start=1):
@@ -394,6 +453,8 @@ def nested_cv_oof(
                     n_splits=inner_splits,
                     n_iter=n_iter_small,
                     seed=seed + fold_idx,
+                    candidate_params=candidate_param_sets.get(name, []),
+                    enable_random_search=enable_random_search,
                 )
                 best_params_fold.append(best)
 
@@ -456,6 +517,8 @@ def nested_cv_oof(
                         n_splits=inner_splits,
                         n_iter=n_iter_small,
                         seed=seed + fold_idx,
+                        candidate_params=None,
+                        enable_random_search=True,
                     )
 
                     scaler = CustomColumnScaler(
@@ -926,6 +989,7 @@ def main(args):
     w_best: Optional[float] = None
     mu_train: Optional[np.ndarray] = None
 
+    candidate_params_from_m2: Dict[str, List[Dict[str, Any]]] = {}
     ensemble_strategy: Optional[str] = None
     if run_cv:
         y_np = y.to_numpy()
@@ -943,6 +1007,10 @@ def main(args):
                 n_iter_small=args.inner_iter,
                 m_grid=(parse_float_list(args.m2_m_grid) or [args.m2_m]),
             )
+            for spec_name, spec_result in nested_results_m2.items():
+                params = spec_result.get("refit_params") or {}
+                if params:
+                    candidate_params_from_m2[spec_name] = [dict(params)]
             best_m2_spec_name, best_m2_result = select_best_spec(nested_results_m2)
             if best_m2_result is not None and best_m2_spec_name is not None:
                 best_m2_spec = selected_m2_specs[best_m2_spec_name]
@@ -974,6 +1042,8 @@ def main(args):
                 seed=args.seed,
                 inner_splits=args.inner_splits,
                 n_iter_small=args.inner_iter,
+                candidate_param_sets=candidate_params_from_m2,
+                enable_random_search=False,
             )
             best_m1_spec_name, best_m1_result = select_best_spec(nested_results_m1)
             if best_m1_result is not None and best_m1_spec_name is not None:
