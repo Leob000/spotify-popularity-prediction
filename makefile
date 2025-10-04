@@ -12,10 +12,10 @@ M2_M?=300.0
 M2_M_GRID?="1.0,50.0,100.0,150.0,200.0,300.0,400.0,500.0,600.0,700.0"
 FOLDS?=5
 
-M1_MODELS?="rf" # [rf, et, hgb, gbr, enet, svr, knn, xgb, cat]
-M2_MODELS?="rf" # [rf, et, hgb, gbr, enet, svr, knn, xgb, cat]
+M1_MODELS?="rf, et, xgb, cat" # [rf, et, hgb, gbr, enet, svr, knn, xgb, cat]
+M2_MODELS?="rf, et, xgb, cat" # [rf, et, hgb, gbr, enet, svr, knn, xgb, cat]
 INNER_SPLITS?=3
-INNER_ITER?=1
+INNER_ITER?=20
 
 submit:
 	kaggle competitions submit -c spotify-predire-la-popularite-dun-titre -f $(DATA_DIR)$(SUBMIT_FILE) -m $(SUBMIT_MSG)
@@ -31,6 +31,7 @@ train:
 		--m2-models $(M2_MODELS) \
 		--inner-splits $(INNER_SPLITS) \
 		--inner-iter $(INNER_ITER) \
+		--m2-blend-bag-boost \
 		--show-importance
 
 m_search:
